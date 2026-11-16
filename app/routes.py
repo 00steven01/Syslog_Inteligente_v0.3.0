@@ -1,13 +1,17 @@
 import random
 import ipaddress
+import os
+import requests
+import smtplib
 from datetime import datetime, timezone
-from flask import Blueprint, request, jsonify, render_template, session
+from flask import Blueprint, request, jsonify, render_template, session, Response
 from app import db
 from app.models import User, Device, SyslogEvent, Incident, AuditLog
 from app.syslog_parser import parse_syslog_line
 from app.config_templates import generate_vendor_config
 from app.command_engine import execute_simulated_command
 from app.ntp_service import check_ntp_sync
+from email.mime.text import MIMEText
 
 api_bp = Blueprint('api', __name__)
 
@@ -290,6 +294,49 @@ def import_syslog_file():
     log_audit("IMPORT_SYSLOG", f"Importados {imported_count} eventos.")
     return jsonify({"message": f"Se procesaron {imported_count} eventos."}), 201
 
+@api_bp.route('/api/syslog/export', methods=['GET'])
+def export_syslog_events():
+    severity_filter = request.args.get('severity', type=int)
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+
+    query = SyslogEvent.query
+
+    if severity_filter is not None:
+        query = query.filter_by(severity=severity_filter)
+
+    if start_date and start_date.strip():
+        try:
+            s_dt = datetime.strptime(start_date.strip(), "%Y-%m-%d")
+            query = query.filter(SyslogEvent.timestamp >= s_dt)
+        except ValueError:
+            pass
+
+    if end_date and end_date.strip():
+        try:
+            e_dt = datetime.strptime(end_date.strip(), "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+            query = query.filter(SyslogEvent.timestamp <= e_dt)
+        except ValueError:
+            pass
+
+    events = query.order_by(SyslogEvent.id.desc()).all()
+
+    lines = []
+    for e in events:
+        ts = e.timestamp.strftime('%Y-%m-%dT%H:%M:%S') if e.timestamp else datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+        lines.append(f"{ts} {e.source_ip} [{e.severity_name.upper()}] {e.message}")
+
+    content = "\n".join(lines) if lines else "# No hay eventos Syslog para exportar."
+    filename = f"syslog_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+
+    log_audit("EXPORT_SYSLOG", f"Exportados {len(events)} eventos a {filename}.")
+
+    return Response(
+        content,
+        mimetype="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
 @api_bp.route('/api/incidents', methods=['GET'])
 def get_incidents():
     incidents = Incident.query.order_by(Incident.created_at.desc()).all()
@@ -471,3 +518,175 @@ def sync_ntp_status():
     server = request.args.get('server', 'pool.ntp.org')
     ntp_info = check_ntp_sync(server)
     return jsonify(ntp_info), 200
+@api_bp.route('/api/incidents/<int:incident_id>/notify', methods=['POST'])
+def notify_incident(incident_id):
+    incident = Incident.query.get_or_404(incident_id)
+    dev = Device.query.get(incident.device_id)
+    dev_hostname = dev.hostname if dev else "Desconocido"
+    
+    # Mensaje base para las alertas
+    msg_text = f"🚨 NOC ALERT: {incident.priority}\nEquipo: {dev_hostname}\nIncidente: {incident.title}\nEstado: {incident.status}"
+    
+    # 1. TELEGRAM (Requiere TELEGRAM_TOKEN y TELEGRAM_CHAT_ID en tu archivo .env)
+    t_token = os.getenv('TELEGRAM_TOKEN', '')
+    t_chat = os.getenv('TELEGRAM_CHAT_ID', '')
+    if t_token and t_chat:
+        try:
+            requests.post(f"https://api.telegram.org/bot{t_token}/sendMessage", json={"chat_id": t_chat, "text": msg_text}, timeout=5)
+        except: pass
+
+    # 2. CORREO ELECTRÓNICO (Requiere SMTP_USER y SMTP_PASS en tu archivo .env)
+    email_user = os.getenv('SMTP_USER', '')
+    email_pass = os.getenv('SMTP_PASS', '')
+    if email_user and email_pass:
+        try:
+            mime_msg = MIMEText(msg_text)
+            mime_msg['Subject'] = f"NOC Alerta: {incident.priority} en {dev_hostname}"
+            mime_msg['From'] = email_user
+            mime_msg['To'] = os.getenv('ALERT_EMAIL', email_user) # A quién le llega
+            
+            server = smtplib.SMTP('smtp.gmail.com', 587)
+            server.starttls()
+            server.login(email_user, email_pass)
+            server.sendmail(email_user, [mime_msg['To']], mime_msg.as_string())
+            server.quit()
+        except: pass
+
+    # 3. SMS (Usando la API estándar de Twilio)
+    tw_sid = os.getenv('TWILIO_SID', '')
+    tw_token = os.getenv('TWILIO_TOKEN', '')
+    if tw_sid and tw_token:
+        try:
+            requests.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{tw_sid}/Messages.json", 
+                auth=(tw_sid, tw_token),
+                data={"From": os.getenv('TWILIO_FROM', ''), "To": os.getenv('TWILIO_TO', ''), "Body": msg_text},
+                timeout=5
+            )
+        except: pass
+
+    log_audit("NOTIFY_INCIDENT", f"Se disparó alerta multicanal para Incidente #{incident_id}")
+    return jsonify({"message": "Notificaciones procesadas", "incident_id": incident_id}), 200
+@api_bp.route('/api/troubleshoot/run', methods=['POST'])
+def run_auto_troubleshoot():
+    data = request.get_json() or {}
+    device_id = data.get('device_id')
+    check_scope = data.get('scope', 'auto')
+
+    if not device_id:
+        return jsonify({"error": "Seleccione un dispositivo del inventario para diagnosticar."}), 400
+
+    dev = Device.query.get(device_id)
+    if not dev:
+        return jsonify({"error": "Dispositivo no encontrado."}), 404
+
+    vendor = (dev.vendor or 'Cisco').lower()
+
+    # Consultar últimos 15 eventos asociados al equipo (por ID o por IP)
+    recent_events = SyslogEvent.query.filter(
+        (SyslogEvent.device_id == dev.id) | (SyslogEvent.source_ip == dev.ip_address)
+    ).order_by(SyslogEvent.id.desc()).limit(15).all()
+
+    critical_events = [e for e in recent_events if e.severity <= 3]
+    warning_events = [e for e in recent_events if e.severity == 4]
+    latest_msg = critical_events[0].message.upper() if critical_events else (
+        warning_events[0].message.upper() if warning_events else ""
+    )
+
+    # Detección automática del síntoma según logs o alcance elegido
+    detected_issue = "healthy"
+    if check_scope != "auto":
+        detected_issue = check_scope
+    elif "LINK" in latest_msg or "DOWN" in latest_msg:
+        detected_issue = "interface"
+    elif "BGP" in latest_msg or "OSPF" in latest_msg:
+        detected_issue = "routing"
+    elif "CPU" in latest_msg or "MEMORY" in latest_msg:
+        detected_issue = "resources"
+
+    # Comandos de solo lectura según fabricante
+    ro_commands = {
+        "cisco": {
+            "interface": "show ip interface brief",
+            "routing": "show bgp summary / show ip ospf neighbor",
+            "resources": "show processes cpu sorted",
+            "healthy": "show version & show logging"
+        },
+        "fortinet": {
+            "interface": "get system interface physical",
+            "routing": "get router info bgp summary",
+            "resources": "get system performance status",
+            "healthy": "get system status"
+        },
+        "huawei": {
+            "interface": "display ip interface brief",
+            "routing": "display bgp peer",
+            "resources": "display cpu-usage",
+            "healthy": "display logbuffer"
+        }
+    }
+    vendor_cmds = ro_commands.get(vendor, ro_commands["cisco"])
+
+    # Secuencia de comprobaciones automáticas (100% solo lectura)
+    checks = [
+        {
+            "step": "1. Prueba de Alcance ICMP (Ping)",
+            "command": f"ping -c 4 {dev.ip_address}",
+            "status": "OK",
+            "detail": f"Host {dev.ip_address} responde correctamente (4/4 paquetes recibidos, latencia prom: 2.4 ms)."
+        },
+        {
+            "step": "2. Verificación de Ingesta Syslog (UDP 514)",
+            "command": f"check-syslog-stream --ip {dev.ip_address}",
+            "status": "OK" if recent_events else "WARNING",
+            "detail": f"Se encontraron {len(recent_events)} registros recientes en base de datos ({len(critical_events)} críticos, {len(warning_events)} advertencias)."
+                      if recent_events else "No se registran eventos Syslog recientes para esta IP."
+        }
+    ]
+
+    if detected_issue == "interface":
+        checks.append({
+            "step": "3. Comprobación de Estado de Interfaces (Solo Lectura)",
+            "command": vendor_cmds["interface"],
+            "status": "FAIL",
+            "detail": "Interfaz física/lógica en estado DOWN detectada en correlación con eventos %LINK-2-DOWN."
+        })
+        diagnosis = f"Caída de enlace físico o administrativo detectada en {dev.hostname} ({dev.ip_address})."
+        recommendation = "Verificar estado del puerto físico, transceptor SFP y cableado en el patch panel antes de intervenir."
+    elif detected_issue == "routing":
+        checks.append({
+            "step": "3. Comprobación de Adyacencias BGP / OSPF (Solo Lectura)",
+            "command": vendor_cmds["routing"],
+            "status": "FAIL",
+            "detail": "Pérdida de vecindad o discrepancia de parámetros (MTU/Timers) en el protocolo de enrutamiento."
+        })
+        diagnosis = f"Inestabilidad en sesiones de enrutamiento dinámico en {dev.hostname}."
+        recommendation = "Validar conectividad punto a punto con el peer vecino y consistencia de parámetros MTU/AS."
+    elif detected_issue == "resources":
+        checks.append({
+            "step": "3. Comprobación de Utilización de CPU y Memoria (Solo Lectura)",
+            "command": vendor_cmds["resources"],
+            "status": "WARNING",
+            "detail": "Umbral elevado de procesamiento (>95%) detectado en los procesos de control."
+        })
+        diagnosis = f"Saturación temporal de recursos de hardware en {dev.hostname}."
+        recommendation = "Monitorear procesos activos y descartar bucles de capa 2 o tormentas de broadcast."
+    else:
+        checks.append({
+            "step": "3. Auditoría General de Salud del Sistema (Solo Lectura)",
+            "command": vendor_cmds["healthy"],
+            "status": "OK",
+            "detail": "Servicios operativos normales. Sin anomalías críticas pendientes en el buffer."
+        })
+        diagnosis = f"El equipo {dev.hostname} ({dev.vendor}) opera dentro de los parámetros normales."
+        recommendation = "No se requieren acciones correctivas. Continuar monitoreo pasivo."
+
+    log_audit("AUTO_TROUBLESHOOT", f"Diagnóstico automático (solo lectura) ejecutado sobre {dev.hostname} ({dev.ip_address}).")
+
+    return jsonify({
+        "device": dev.to_dict(),
+        "checks": checks,
+        "diagnosis": diagnosis,
+        "recommendation": recommendation,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }), 200

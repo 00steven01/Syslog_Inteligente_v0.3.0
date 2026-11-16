@@ -6,6 +6,7 @@ let allDevicesCache = [];
 
 let allSyslogEventsCache = [];
 let allIncidentsCache = [];
+let activeSshSession = null;
 
 function openEventsFilterModal(filterType) {
     const modalEl = document.getElementById('customEventsFilterModal');
@@ -206,7 +207,7 @@ function switchTab(tabName) {
 
     if (activeTab) activeTab.classList.add('active');
     if (activeView) activeView.classList.remove('d-none');
-
+    if (tabName === 'troubleshoot') initTroubleshootView();
     if (tabName === 'dashboard') loadDashboardData();
     if (tabName === 'devices') loadDevices();
     if (tabName === 'syslog') loadSyslogEvents();
@@ -475,8 +476,13 @@ async function loadIncidents() {
                 <td><span class="badge bg-info">${i.status}</span></td>
                 <td><small>${escapeHtml(i.assignee)}</small></td>
                 <td><small class="text-muted">${escapeHtml(i.root_cause || '-')}</small></td>
+                <td>
+                    <button class="btn btn-sm btn-outline-info" onclick="sendIncidentAlert(${i.id})">
+                        <i class="fa-solid fa-share-nodes"></i> Notificar
+                    </button>
+                </td>
             </tr>
-        `).join('') || '<tr><td colspan="7" class="text-center text-muted">No hay incidentes creados.</td></tr>';
+        `).join('') || '<tr><td colspan="8" class="text-center text-muted">No hay incidentes creados.</td></tr>';
 
     } catch (err) {
         console.error(err);
@@ -579,7 +585,26 @@ function setupFormListeners() {
             }
         });
     }
+const syslogFileInput = document.getElementById('syslog-file-input');
+    if (syslogFileInput) {
+        syslogFileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
 
+            if (!file.name.toLowerCase().endsWith('.txt') && !file.name.toLowerCase().endsWith('.log')) {
+                showAlert('Por favor seleccione un archivo de texto (.txt o .log)', 'warning');
+                e.target.value = '';
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                const textarea = document.getElementById('syslog-raw-text');
+                if (textarea) textarea.value = event.target.result;
+            };
+            reader.readAsText(file, 'UTF-8');
+        });
+    }
     const formImportSys = document.getElementById('form-import-syslog');
     if (formImportSys) {
         formImportSys.addEventListener('submit', async (e) => {
@@ -593,8 +618,7 @@ function setupFormListeners() {
             });
 
             if (res.ok) {
-                const impModal = bootstrap.Modal.getInstance(document.getElementById('importSyslogModal'));
-                if (impModal) impModal.hide();
+                closeImportSyslogModal();
                 e.target.reset();
                 showAlert('Logs procesados e importados correctamente');
                 loadSyslogEvents();
@@ -657,8 +681,82 @@ function setupFormListeners() {
         });
     }
 
+    // Formulario Conexión SSH
+    const formSsh = document.getElementById('form-ssh-connect');
+    if (formSsh) {
+        formSsh.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const host = document.getElementById('ssh-host').value.trim();
+            const port = document.getElementById('ssh-port').value.trim() || '22';
+            const vendor = document.getElementById('ssh-vendor').value;
+            const user = document.getElementById('ssh-user').value.trim();
+
+            activeSshSession = { host, port, vendor, user };
+
+            const vendorSelect = document.getElementById('console-vendor');
+            if (vendorSelect) vendorSelect.value = vendor;
+
+            const banner = document.getElementById('ssh-session-banner');
+            const info = document.getElementById('ssh-session-info');
+            if (info) info.innerText = `${user}@${host}:${port} (${vendor.toUpperCase()})`;
+            if (banner) banner.classList.remove('d-none');
+
+            const term = document.getElementById('terminal-screen');
+            if (term) {
+                term.innerHTML = `
+                    <div class="text-info">SSH-2.0-OpenSSH_8.9p1 — Conectando a ${escapeHtml(host)}:${escapeHtml(port)}...</div>
+                    <div class="text-success">Autenticación aceptada para '${escapeHtml(user)}' (Modo Diagnóstico Solo Lectura).</div>
+                    <div class="text-muted mb-2">Escriba 'help' para ver comandos de visualización disponibles o 'exit' para cerrar sesión.</div>
+                `;
+            }
+
+            closeSshModal();
+            e.target.reset();
+            document.getElementById('ssh-port').value = '22';
+            showAlert(`Conectado por SSH a ${host}`, 'success');
+            document.getElementById('console-cmd')?.focus();
+        });
+    }
+
     const formConsole = document.getElementById('form-console-input');
     if (formConsole) {
+        formConsole.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const vendor = activeSshSession ? activeSshSession.vendor : document.getElementById('console-vendor').value;
+            const cmdInput = document.getElementById('console-cmd');
+            const command = cmdInput.value.trim();
+
+            const term = document.getElementById('terminal-screen');
+            const promptText = activeSshSession
+                ? `${escapeHtml(activeSshSession.user)}@${escapeHtml(activeSshSession.host)}#`
+                : `admin@${vendor}>`;
+
+            term.innerHTML += `<div class="text-warning mt-2">${promptText} ${escapeHtml(command)}</div>`;
+
+            if (activeSshSession && (command.toLowerCase() === 'exit' || command.toLowerCase() === 'quit')) {
+                cmdInput.value = '';
+                disconnectSshSession();
+                return;
+            }
+
+            const res = await fetch('/api/console/execute', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ vendor, command })
+            });
+
+            const data = await res.json();
+            if (data.output === '__CLEAR__') {
+                term.innerHTML = '';
+            } else {
+                const isError = data.output && (data.output.startsWith('Error:') || data.output.startsWith('% Syntax') || data.output.startsWith('Unknown command'));
+                term.innerHTML += `<pre class="${isError ? 'text-danger' : 'text-light'} mb-0">${escapeHtml(data.output)}</pre>`;
+            }
+
+            cmdInput.value = '';
+            term.scrollTop = term.scrollHeight;
+        });
+    
         formConsole.addEventListener('submit', async (e) => {
             e.preventDefault();
             const vendor = document.getElementById('console-vendor').value;
@@ -727,3 +825,153 @@ function closeAddIncidentModal() {
     const el = document.getElementById('customAddIncidentModal');
     if (el) el.classList.add('d-none');
 }
+function exportSyslogEvents() {
+    let url = '/api/syslog/export?';
+    if (currentSeverityFilter !== null) url += `severity=${currentSeverityFilter}&`;
+
+    const startDate = document.getElementById('filter-start-date')?.value;
+    const endDate = document.getElementById('filter-end-date')?.value;
+
+    if (startDate && startDate.trim() !== "") url += `start_date=${startDate}&`;
+    if (endDate && endDate.trim() !== "") url += `end_date=${endDate}&`;
+
+    showAlert('Descargando archivo .txt con los eventos actuales...', 'info');
+    window.location.href = url;
+}
+function openImportSyslogModal() {
+    const el = document.getElementById('customImportSyslogModal');
+    if (el) el.classList.remove('d-none');
+}
+
+function closeImportSyslogModal() {
+    const el = document.getElementById('customImportSyslogModal');
+    if (el) el.classList.add('d-none');
+}
+async function sendIncidentAlert(incidentId) {
+    if (!confirm('¿Desea disparar las alertas configuradas para este incidente?')) return;
+    
+    try {
+        const res = await fetch(`/api/incidents/${incidentId}/notify`, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+            showAlert(data.message || `Alertas enviadas con éxito para el incidente #${incidentId}`, 'success');
+        } else {
+            showAlert(data.error || 'Error al procesar las notificaciones', 'danger');
+        }
+    } catch (e) {
+        showAlert('Error de conexión con el servidor', 'danger');
+    }
+}
+function openSshModal() {
+    const datalist = document.getElementById('ssh-devices-datalist');
+    if (datalist && allDevicesCache.length > 0) {
+        datalist.innerHTML = allDevicesCache
+            .map(d => `<option value="${escapeHtml(d.ip_address)}">${escapeHtml(d.hostname)} (${escapeHtml(d.vendor)})</option>`)
+            .join('');
+    }
+    const el = document.getElementById('customSshModal');
+    if (el) el.classList.remove('d-none');
+}
+
+function closeSshModal() {
+    const el = document.getElementById('customSshModal');
+    if (el) el.classList.add('d-none');
+}
+
+function disconnectSshSession() {
+    const host = activeSshSession ? activeSshSession.host : '';
+    activeSshSession = null;
+
+    const banner = document.getElementById('ssh-session-banner');
+    if (banner) banner.classList.add('d-none');
+
+    const term = document.getElementById('terminal-screen');
+    if (term) {
+        term.innerHTML += `<div class="text-danger mt-2">Connection to ${escapeHtml(host)} closed.</div>`;
+        term.scrollTop = term.scrollHeight;
+    }
+    showAlert('Sesión SSH finalizada', 'info');
+}
+async function initTroubleshootView() {
+    const select = document.getElementById('ts-device-select');
+    if (!select) return;
+
+    try {
+        const res = await fetch('/api/devices');
+        const devices = res.ok ? await res.json() : allDevicesCache;
+        select.innerHTML = devices.map(d =>
+            `<option value="${d.id}">${escapeHtml(d.hostname)} — ${d.ip_address} (${escapeHtml(d.vendor)})</option>`
+        ).join('') || '<option value="">No hay dispositivos registrados</option>';
+    } catch (e) {
+        console.error("Error cargando equipos para troubleshooting:", e);
+    }
+}
+
+document.addEventListener('submit', async (e) => {
+    if (e.target && e.target.id === 'form-auto-troubleshoot') {
+        e.preventDefault();
+        const deviceId = document.getElementById('ts-device-select').value;
+        const scope = document.getElementById('ts-scope-select').value;
+        const container = document.getElementById('ts-results-container');
+        const tsBadge = document.getElementById('ts-timestamp');
+
+        if (!deviceId) {
+            showAlert('Seleccione un dispositivo válido', 'warning');
+            return;
+        }
+
+        container.innerHTML = `
+            <div class="text-center py-4">
+                <div class="spinner-border text-primary mb-2" role="status"></div>
+                <div class="small text-muted">Ejecutando pruebas de alcance y correlación de logs (Solo Lectura)...</div>
+            </div>
+        `;
+
+        try {
+            const res = await fetch('/api/troubleshoot/run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: parseInt(deviceId), scope })
+            });
+            const data = await res.json();
+
+            if (!res.ok) {
+                showAlert(data.error || 'Error al ejecutar diagnóstico', 'danger');
+                return;
+            }
+
+            if (tsBadge) tsBadge.innerText = `Ejecutado: ${data.timestamp}`;
+
+            const stepsHtml = data.checks.map(c => {
+                const badgeClass = c.status === 'OK' ? 'bg-success' : (c.status === 'WARNING' ? 'bg-warning text-dark' : 'bg-danger');
+                return `
+                    <div class="border rounded p-2 mb-2">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <strong class="small">${escapeHtml(c.step)}</strong>
+                            <span class="badge ${badgeClass}">${c.status}</span>
+                        </div>
+                        <div class="small font-monospace text-primary mb-1">$ ${escapeHtml(c.command)}</div>
+                        <div class="small text-muted">${escapeHtml(c.detail)}</div>
+                    </div>
+                `;
+            }).join('');
+
+            container.innerHTML = `
+                <div class="mb-3">
+                    <span class="badge bg-secondary me-1">${escapeHtml(data.device.hostname)}</span>
+                    <span class="badge bg-primary me-1">${escapeHtml(data.device.ip_address)}</span>
+                    <span class="badge bg-info text-dark">${escapeHtml(data.device.vendor)}</span>
+                </div>
+                ${stepsHtml}
+                <div class="alert alert-secondary mt-3 mb-0">
+                    <div class="fw-bold small mb-1"><i class="fa-solid fa-file-medical me-1 text-danger"></i>Diagnóstico Preliminar:</div>
+                    <div class="small mb-2">${escapeHtml(data.diagnosis)}</div>
+                    <div class="fw-bold small mb-1"><i class="fa-solid fa-user-check me-1 text-success"></i>Sugerencia Operativa (Human-in-the-Loop):</div>
+                    <div class="small mb-0">${escapeHtml(data.recommendation)}</div>
+                </div>
+            `;
+        } catch (err) {
+            showAlert('Error de conexión con el motor de diagnóstico', 'danger');
+        }
+    }
+});
